@@ -1,7 +1,12 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use crate::logging::{
+    DatabaseOptions, RedoEvent, append_binlog, append_error, append_redolog, append_slow_sql,
+    append_undolog,
+};
 use crate::query::QueryResult;
 use crate::sql::ast::Statement;
 use crate::sql::parse_sql;
@@ -12,18 +17,28 @@ pub struct Database {
     path: Option<PathBuf>,
     catalog: Catalog,
     transaction: Option<Catalog>,
+    options: DatabaseOptions,
 }
 
 impl Database {
     pub fn memory() -> Self {
+        Self::memory_with_options(DatabaseOptions::default())
+    }
+
+    pub fn memory_with_options(options: DatabaseOptions) -> Self {
         Self {
             path: None,
             catalog: Catalog::empty(),
             transaction: None,
+            options,
         }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, DatabaseOptions::default())
+    }
+
+    pub fn open_with_options(path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let catalog = if path.exists() && path.metadata()?.len() > 0 {
             Catalog::decode(&fs::read_to_string(&path)?)?
@@ -35,11 +50,59 @@ impl Database {
             path: Some(path),
             catalog,
             transaction: None,
+            options,
         })
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
+        let started = Instant::now();
+        let result = self.execute_inner(sql);
+        let elapsed = started.elapsed();
+        match &result {
+            Ok(_) => append_slow_sql(&self.options, sql, elapsed),
+            Err(error) => append_error(&self.options, sql, &error.to_string()),
+        }
+        result
+    }
+
+    fn execute_inner(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = parse_sql(sql)?;
+        let mutates = statement.mutates_catalog();
+        let transaction_control = matches!(
+            &statement,
+            Statement::Begin | Statement::Commit | Statement::Rollback
+        );
+        let commits = matches!(&statement, Statement::Commit);
+
+        if mutates {
+            if self.options.undolog_path.is_some() {
+                append_undolog(&self.options, sql, &self.active_catalog().encode())?;
+            }
+            append_redolog(&self.options, RedoEvent::Begin, sql)?;
+        } else if commits {
+            append_redolog(&self.options, RedoEvent::Begin, sql)?;
+        }
+
+        let result = self.execute_parsed(statement);
+        match &result {
+            Ok(_) => {
+                if mutates || transaction_control {
+                    append_binlog(&self.options, sql)?;
+                }
+                if mutates || commits {
+                    append_redolog(&self.options, RedoEvent::Commit, sql)?;
+                }
+            }
+            Err(_) => {
+                if mutates || commits {
+                    let _ = append_redolog(&self.options, RedoEvent::Abort, sql);
+                }
+            }
+        }
+        result
+    }
+
+    fn execute_parsed(&mut self, statement: Statement) -> Result<QueryResult> {
         match statement {
             Statement::Begin => self.begin(),
             Statement::Commit => self.commit(),
@@ -104,6 +167,10 @@ impl Database {
 
     fn active_catalog_mut(&mut self) -> &mut Catalog {
         self.transaction.as_mut().unwrap_or(&mut self.catalog)
+    }
+
+    fn active_catalog(&self) -> &Catalog {
+        self.transaction.as_ref().unwrap_or(&self.catalog)
     }
 
     fn persist(&self) -> Result<()> {
@@ -363,6 +430,52 @@ mod tests {
         fs::write(&path, "BAD\n").unwrap();
         assert!(Database::open(&path).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn options_write_execution_logs() {
+        let dir = temp_path("exec_logs");
+        let options = DatabaseOptions::default()
+            .with_slow_sql_log(dir.join("slow.log"), std::time::Duration::ZERO)
+            .with_error_log(dir.join("error.log"))
+            .with_binlog(dir.join("bin.log"))
+            .with_redolog(dir.join("redo.log"))
+            .with_undolog(dir.join("undo.log"));
+        let mut db = Database::memory_with_options(options);
+
+        create_users(&mut db);
+        db.execute("INSERT INTO users VALUES (1, 'Ada', 36)")
+            .unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("COMMIT").unwrap();
+        assert!(db.execute("INSERT INTO missing VALUES (2)").is_err());
+        assert!(db.execute("SELECT * FROM missing").is_err());
+
+        assert!(
+            fs::read_to_string(dir.join("slow.log"))
+                .unwrap()
+                .contains("CREATE TABLE users")
+        );
+        assert!(
+            fs::read_to_string(dir.join("error.log"))
+                .unwrap()
+                .contains("unknown table")
+        );
+        assert!(
+            fs::read_to_string(dir.join("bin.log"))
+                .unwrap()
+                .contains("COMMIT")
+        );
+        let redo = fs::read_to_string(dir.join("redo.log")).unwrap();
+        assert!(redo.contains("BEGIN"));
+        assert!(redo.contains("COMMIT"));
+        assert!(redo.contains("ABORT"));
+        assert!(
+            fs::read_to_string(dir.join("undo.log"))
+                .unwrap()
+                .contains("UNDO")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -12,6 +12,8 @@ placeholder. The first milestone includes:
 - Full-text inverted indexes over `TEXT` columns.
 - Vector nearest-neighbor queries over `VECTOR` columns.
 - Geographic distance filters over `POINT(lon, lat)` columns.
+- Thread-safe connection pools with configurable checkout limits.
+- Slow SQL logs, error logs, binlog, redolog, and undolog append streams.
 - Unit tests for the implemented behavior.
 - Stable performance baselines for bulk inserts, indexed lookups, full-text
   search, vector ordering, and geo filters.
@@ -22,6 +24,8 @@ The crate is split into production modules:
 
 - `engine`: public `Database`, transaction handling, statement execution, and
   persistence.
+- `pool`: thread-safe `ConnectionPool` and checked-out `Connection` handles.
+- `logging`: `DatabaseOptions` plus append-only SQL and recovery log writers.
 - `sql`: SQL AST and parser.
 - `storage`: catalog, table, indexes, and disk codec.
 - `value`, `query`, `error`, `identifier`: shared domain types and helpers.
@@ -30,6 +34,56 @@ The user-facing goal is intentionally larger than this first commit. A
 production database with complete SQL compatibility, formally demonstrated
 ACID guarantees, 100% measured coverage, and performance beyond SQLite is a
 multi-release project. This crate is the executable foundation for that work.
+
+## Library usage
+
+The crate exposes a single embedded database type:
+
+```rust
+use fsql::Database;
+
+let mut db = Database::memory();
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")?;
+db.execute("INSERT INTO users VALUES (1, 'Ada')")?;
+let rows = db.execute("SELECT name FROM users WHERE id = 1")?.rows;
+```
+
+Use `Database::memory()` for an in-memory database or `Database::open(path)` for
+file-backed persistence. Mutating statements outside an explicit transaction are
+persisted immediately. `BEGIN`, `COMMIT`, and `ROLLBACK` keep a single-writer
+transaction open in memory until commit time.
+
+## Connection pool and logs
+
+Use `ConnectionPool` when the database is shared by multiple threads. The pool
+limits the number of checked-out connections, offers blocking `get()` and
+non-blocking `try_get()`, and serializes statement execution through the shared
+embedded engine.
+
+```rust
+use std::time::Duration;
+use fsql::{ConnectionPool, DatabaseOptions};
+
+let options = DatabaseOptions::default()
+    .with_slow_sql_log("slow.log", Duration::from_millis(50))
+    .with_error_log("error.log")
+    .with_binlog("bin.log")
+    .with_redolog("redo.log")
+    .with_undolog("undo.log");
+
+let pool = ConnectionPool::open_with_options("app.fsql", 8, options)?;
+let connection = pool.get()?;
+connection.execute("SELECT * FROM users")?;
+```
+
+The log streams are append-only text files:
+
+- Slow SQL log: successful statements whose elapsed time meets the configured
+  threshold.
+- Error log: failed SQL text and the returned error.
+- Binlog: logical mutating SQL and transaction-control SQL.
+- Redolog: `BEGIN`, `COMMIT`, and `ABORT` records around mutations and commits.
+- Undolog: catalog snapshots before mutating statements.
 
 ## SQL subset
 
@@ -58,7 +112,45 @@ SELECT * FROM docs WHERE GEO_DISTANCE(place, POINT(121.47, 31.23)) < 1000;
 BEGIN;
 UPDATE docs SET title = 'Fast Rust' WHERE id = 1;
 ROLLBACK;
+DELETE FROM docs WHERE id = 1;
 ```
+
+### Supported statements and values
+
+- `CREATE TABLE`, `CREATE INDEX`, `CREATE FULLTEXT INDEX`
+- `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- `BEGIN`, `COMMIT`, `ROLLBACK`
+- Column types: `INTEGER`, `FLOAT`, `BOOLEAN`, `TEXT`, `VECTOR`, `POINT`
+- Value literals: `NULL`, `TRUE`, `FALSE`, quoted strings, numeric literals,
+  vectors like `[0.1, 0.2]`, and points like `POINT(121.47, 31.23)`
+
+### Current query capabilities
+
+- `WHERE` supports equality predicates such as `id = 1`
+- `WHERE MATCH(column, 'terms')` supports full-text token matching on `TEXT`
+  columns
+- `WHERE GEO_DISTANCE(column, POINT(...)) < meters` and `<=` support radius
+  filters on `POINT` columns
+- `ORDER BY VECTOR_DISTANCE(column, [...]) ASC|DESC` supports nearest-neighbor
+  ordering on `VECTOR` columns
+- `LIMIT n` is supported on `SELECT`
+
+## Current limitations
+
+This is intentionally a prototype, not a full SQL engine.
+
+- `WHERE` does not support `AND`, `OR`, ranges, joins, or arbitrary expressions
+- `ORDER BY` only supports `VECTOR_DISTANCE(...)`
+- Full-text search tokenizes by non-alphanumeric separators, lowercases tokens,
+  and matches all query tokens
+- Vector ordering requires the query vector and stored vector to have the same
+  dimensions
+- Geographic distance uses the haversine formula and interprets thresholds in
+  meters
+- The connection pool is thread-safe and supports concurrent callers, but the
+  current engine serializes statement execution instead of providing MVCC.
+- Binlog, redolog, and undolog are written and tested as append-only streams;
+  automated crash recovery and replay are future work.
 
 ## Development
 
@@ -67,6 +159,10 @@ cargo test
 cargo llvm-cov --summary-only --fail-under-lines 100
 ```
 
-`cargo test` also runs `tests/performance.rs`. Those performance tests are
-skipped only when `cargo llvm-cov` sets `cfg(coverage)`, so benchmark assertions
-do not pollute library source coverage.
+`cargo test` also runs `tests/performance.rs`. Those tests enforce lightweight
+performance baselines for bulk inserts, indexed lookups, full-text search,
+vector ordering, and geo filters.
+
+The performance tests are skipped only when `cargo llvm-cov` sets
+`cfg(coverage)`, so benchmark-style assertions do not pollute library source
+coverage.

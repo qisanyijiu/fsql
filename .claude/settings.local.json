@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rg --files -g 'README*' -g 'package.json' -g 'pyproject.toml' -g 'Cargo.toml' -g 'go.mod' -g '*.sql' -g 'CLAUDE.md' -g 'AGENTS.md' .)",
+      "Bash(rg *)",
+      "Bash(cargo test *)"
+    ]
+  }
+}
