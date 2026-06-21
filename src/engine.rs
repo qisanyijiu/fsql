@@ -1,16 +1,17 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::logging::{
-    DatabaseOptions, RedoEvent, append_binlog, append_error, append_redolog, append_slow_sql,
-    append_undolog,
+    DatabaseOptions, FsyncMode, RedoEvent, append_binlog, append_error, append_redolog,
+    append_slow_sql, append_undolog, sync_file,
 };
 use crate::query::QueryResult;
 use crate::sql::ast::Statement;
-use crate::sql::parse_sql;
-use crate::storage::{Catalog, Table};
+use crate::sql::parse_sql_with_dialect;
+use crate::storage::{Catalog, Table, TableRuntimeOptions};
 use crate::{Error, Result};
 
 pub struct Database {
@@ -18,6 +19,7 @@ pub struct Database {
     catalog: Catalog,
     transaction: Option<Catalog>,
     options: DatabaseOptions,
+    statement_cache: BTreeMap<String, Statement>,
 }
 
 impl Database {
@@ -26,12 +28,18 @@ impl Database {
     }
 
     pub fn memory_with_options(options: DatabaseOptions) -> Self {
-        Self {
+        Self::try_memory_with_options(options).expect("invalid database options")
+    }
+
+    pub fn try_memory_with_options(options: DatabaseOptions) -> Result<Self> {
+        options.validate()?;
+        Ok(Self {
             path: None,
             catalog: Catalog::empty(),
             transaction: None,
             options,
-        }
+            statement_cache: BTreeMap::new(),
+        })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -39,9 +47,11 @@ impl Database {
     }
 
     pub fn open_with_options(path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
+        options.validate()?;
         let path = path.as_ref().to_path_buf();
+        let table_options = table_runtime_options(&options);
         let catalog = if path.exists() && path.metadata()?.len() > 0 {
-            Catalog::decode(&fs::read_to_string(&path)?)?
+            Catalog::decode_with_options(&fs::read_to_string(&path)?, table_options)?
         } else {
             Catalog::empty()
         };
@@ -51,6 +61,7 @@ impl Database {
             catalog,
             transaction: None,
             options,
+            statement_cache: BTreeMap::new(),
         })
     }
 
@@ -66,7 +77,7 @@ impl Database {
     }
 
     fn execute_inner(&mut self, sql: &str) -> Result<QueryResult> {
-        let statement = parse_sql(sql)?;
+        let statement = self.parse_statement(sql)?;
         let mutates = statement.mutates_catalog();
         let transaction_control = matches!(
             &statement,
@@ -102,6 +113,26 @@ impl Database {
         result
     }
 
+    fn parse_statement(&mut self, sql: &str) -> Result<Statement> {
+        if self.options.cache_capacity == 0 {
+            return parse_sql_with_dialect(sql, self.options.sql_dialect);
+        }
+
+        let key = sql.trim().trim_end_matches(';').trim().to_string();
+        if let Some(statement) = self.statement_cache.get(&key) {
+            return Ok(statement.clone());
+        }
+
+        let statement = parse_sql_with_dialect(sql, self.options.sql_dialect)?;
+        if self.statement_cache.len() >= self.options.cache_capacity {
+            if let Some(first_key) = self.statement_cache.keys().next().cloned() {
+                self.statement_cache.remove(&first_key);
+            }
+        }
+        self.statement_cache.insert(key, statement.clone());
+        Ok(statement)
+    }
+
     fn execute_parsed(&mut self, statement: Statement) -> Result<QueryResult> {
         match statement {
             Statement::Begin => self.begin(),
@@ -119,7 +150,8 @@ impl Database {
         let mutates = statement.mutates_catalog();
         if mutates && self.transaction.is_none() {
             let before = self.catalog.clone();
-            match execute_statement(&mut self.catalog, statement) {
+            let options = table_runtime_options(&self.options);
+            match execute_statement_with_options(&mut self.catalog, statement, options) {
                 Ok(result) => {
                     if let Err(error) = self.persist() {
                         self.catalog = before;
@@ -133,7 +165,8 @@ impl Database {
                 }
             }
         } else {
-            execute_statement(self.active_catalog_mut(), statement)
+            let options = table_runtime_options(&self.options);
+            execute_statement_with_options(self.active_catalog_mut(), statement, options)
         }
     }
 
@@ -186,19 +219,33 @@ impl Database {
 
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let mut file = File::create(&tmp)?;
-        file.write_all(self.catalog.encode().as_bytes())?;
-        file.sync_all()?;
+        let encoded = self.catalog.encode();
+        for chunk in encoded.as_bytes().chunks(self.options.page_size) {
+            file.write_all(chunk)?;
+        }
+        sync_file(&file, self.options.fsync_mode)?;
         drop(file);
         fs::rename(&tmp, path)?;
 
-        if let Some(parent_file) = path.parent().and_then(|parent| File::open(parent).ok()) {
-            let _ = parent_file.sync_all();
+        if self.options.fsync_mode != FsyncMode::Never {
+            if let Some(parent_file) = path.parent().and_then(|parent| File::open(parent).ok()) {
+                let _ = parent_file.sync_all();
+            }
         }
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<QueryResult> {
+    execute_statement_with_options(catalog, statement, TableRuntimeOptions::default())
+}
+
+fn execute_statement_with_options(
+    catalog: &mut Catalog,
+    statement: Statement,
+    options: TableRuntimeOptions,
+) -> Result<QueryResult> {
     match statement {
         Statement::CreateTable { name, columns } => {
             if catalog.tables.contains_key(&name) {
@@ -220,7 +267,7 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
                 .get_mut(&table)
                 .ok_or_else(|| Error::Execution("unknown table".into()))?;
             if fulltext {
-                table.create_fulltext_index(name, column)?;
+                table.create_fulltext_index_with_options(name, column, options)?;
             } else {
                 table.create_index(name, column)?;
             }
@@ -235,7 +282,7 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
                 .tables
                 .get_mut(&table)
                 .ok_or_else(|| Error::Execution("unknown table".into()))?;
-            table.insert(columns, values)?;
+            table.insert_with_options(columns, values, options)?;
             Ok(QueryResult::affected(1, "row inserted"))
         }
         Statement::Select {
@@ -249,9 +296,9 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
                 .tables
                 .get(&table)
                 .ok_or_else(|| Error::Execution("unknown table".into()))?;
-            Ok(QueryResult::rows(
-                table.select(projection, filter, order, limit)?,
-            ))
+            Ok(QueryResult::rows(table.select_with_options(
+                projection, filter, order, limit, options,
+            )?))
         }
         Statement::Update {
             table,
@@ -262,7 +309,7 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
                 .tables
                 .get_mut(&table)
                 .ok_or_else(|| Error::Execution("unknown table".into()))?;
-            let affected = table.update(assignments, filter)?;
+            let affected = table.update_with_options(assignments, filter, options)?;
             Ok(QueryResult::affected(affected, "row(s) updated"))
         }
         Statement::Delete { table, filter } => {
@@ -270,7 +317,7 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
                 .tables
                 .get_mut(&table)
                 .ok_or_else(|| Error::Execution("unknown table".into()))?;
-            let affected = table.delete(filter)?;
+            let affected = table.delete_with_options(filter, options)?;
             Ok(QueryResult::affected(affected, "row(s) deleted"))
         }
         Statement::Begin | Statement::Commit | Statement::Rollback => Err(Error::Execution(
@@ -279,11 +326,21 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
     }
 }
 
+fn table_runtime_options(options: &DatabaseOptions) -> TableRuntimeOptions {
+    TableRuntimeOptions {
+        fulltext_tokenizer: options.fulltext_tokenizer,
+        vector_index: options.vector_index,
+        geo_coordinate_system: options.geo_coordinate_system,
+        worker_threads: options.worker_threads,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::ast::{Column, ColumnType};
     use crate::value::Value;
+    use crate::{SqlDialect, WalMode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -476,6 +533,68 @@ mod tests {
                 .contains("UNDO")
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_options_validate_and_drive_engine_behavior() {
+        let path = temp_path("bad_options");
+        assert!(
+            Database::open_with_options(&path, DatabaseOptions::default().with_page_size(1000))
+                .is_err()
+        );
+
+        let dir = temp_path("runtime_options");
+        let redo_path = dir.join("redo.log");
+        let options = DatabaseOptions::default()
+            .with_page_size(512)
+            .with_cache_capacity(1)
+            .with_fsync_mode(FsyncMode::Never)
+            .with_sql_dialect(SqlDialect::Sqlite)
+            .with_redolog(&redo_path)
+            .with_wal_mode(WalMode::Disabled);
+        let mut db = Database::try_memory_with_options(options).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("BEGIN IMMEDIATE").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada')").unwrap();
+        db.execute("END").unwrap();
+        assert_eq!(
+            db.execute("SELECT name FROM users WHERE id = 1")
+                .unwrap()
+                .rows[0]
+                .get("name"),
+            Some(&Value::Text("Ada".into()))
+        );
+        assert!(
+            db.execute("SELECT * FROM users ORDER BY VECTOR_DISTANCE(name, [1.0])")
+                .is_err()
+        );
+        assert!(!redo_path.exists());
+
+        let file_path = temp_path("fsync_never_file");
+        let mut file_db = Database::open_with_options(
+            &file_path,
+            DatabaseOptions::default()
+                .with_page_size(512)
+                .with_cache_capacity(0)
+                .with_fsync_mode(FsyncMode::Never),
+        )
+        .unwrap();
+        create_users(&mut file_db);
+        file_db
+            .execute("INSERT INTO users VALUES (1, 'Ada', 36)")
+            .unwrap();
+        assert!(file_path.exists());
+        fs::remove_file(file_path).unwrap();
+
+        let mut cached =
+            Database::try_memory_with_options(DatabaseOptions::default().with_cache_capacity(1))
+                .unwrap();
+        cached
+            .execute("CREATE TABLE cache (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        cached.execute("SELECT * FROM cache").unwrap();
+        cached.execute("SELECT id FROM cache").unwrap();
     }
 
     #[test]

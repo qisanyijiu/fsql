@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::sql::ast::{Column, ColumnType};
-use crate::storage::Table;
 use crate::storage::codec::{decode_string, decode_value, encode_string, encode_value};
+use crate::storage::{Table, TableRuntimeOptions};
 use crate::value::Row;
 use crate::{Error, Result};
 
@@ -67,7 +67,12 @@ impl Catalog {
         out
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(input: &str) -> Result<Self> {
+        Self::decode_with_options(input, TableRuntimeOptions::default())
+    }
+
+    pub(crate) fn decode_with_options(input: &str, options: TableRuntimeOptions) -> Result<Self> {
         let mut lines = input.lines();
         match lines.next() {
             Some("FSQ1") => {}
@@ -146,7 +151,7 @@ impl Catalog {
                     let mut table = current
                         .take()
                         .ok_or_else(|| Error::Execution("endtable without table".into()))?;
-                    table.rebuild_indexes()?;
+                    table.rebuild_indexes_with_options(options)?;
                     catalog.tables.insert(table.name.clone(), table);
                 }
                 other => {

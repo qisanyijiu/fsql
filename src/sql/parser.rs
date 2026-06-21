@@ -1,21 +1,27 @@
 use crate::identifier::normalize_identifier;
+use crate::logging::SqlDialect;
 use crate::sql::ast::{Column, ColumnType, Filter, Order, Projection, Statement};
 use crate::value::{Point, Value};
 use crate::{Error, Result};
 
+#[cfg(test)]
 pub(crate) fn parse_sql(sql: &str) -> Result<Statement> {
+    parse_sql_with_dialect(sql, SqlDialect::Fsql)
+}
+
+pub(crate) fn parse_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Result<Statement> {
     let sql = sql.trim().trim_end_matches(';').trim();
     if sql.is_empty() {
         return Err(Error::Parse("empty SQL".into()));
     }
 
-    if sql.eq_ignore_ascii_case("BEGIN") || sql.eq_ignore_ascii_case("BEGIN TRANSACTION") {
+    if is_begin(sql, dialect) {
         return Ok(Statement::Begin);
     }
-    if sql.eq_ignore_ascii_case("COMMIT") {
+    if is_commit(sql, dialect) {
         return Ok(Statement::Commit);
     }
-    if sql.eq_ignore_ascii_case("ROLLBACK") {
+    if is_rollback(sql, dialect) {
         return Ok(Statement::Rollback);
     }
     if starts_with_ci(sql, "CREATE TABLE") {
@@ -38,6 +44,26 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Statement> {
     }
 
     Err(Error::Parse("unsupported SQL statement".into()))
+}
+
+fn is_begin(sql: &str, dialect: SqlDialect) -> bool {
+    sql.eq_ignore_ascii_case("BEGIN")
+        || sql.eq_ignore_ascii_case("BEGIN TRANSACTION")
+        || matches!(dialect, SqlDialect::Sqlite)
+            && (sql.eq_ignore_ascii_case("BEGIN IMMEDIATE")
+                || sql.eq_ignore_ascii_case("BEGIN EXCLUSIVE"))
+        || matches!(dialect, SqlDialect::PostgreSql) && sql.eq_ignore_ascii_case("BEGIN WORK")
+}
+
+fn is_commit(sql: &str, dialect: SqlDialect) -> bool {
+    sql.eq_ignore_ascii_case("COMMIT")
+        || matches!(dialect, SqlDialect::Sqlite) && sql.eq_ignore_ascii_case("END")
+        || matches!(dialect, SqlDialect::PostgreSql) && sql.eq_ignore_ascii_case("COMMIT WORK")
+}
+
+fn is_rollback(sql: &str, dialect: SqlDialect) -> bool {
+    sql.eq_ignore_ascii_case("ROLLBACK")
+        || matches!(dialect, SqlDialect::PostgreSql) && sql.eq_ignore_ascii_case("ROLLBACK WORK")
 }
 
 fn parse_create_table(sql: &str) -> Result<Statement> {
@@ -535,6 +561,31 @@ mod tests {
         assert_eq!(parse_sql(" begin transaction ;").unwrap(), Statement::Begin);
         assert_eq!(parse_sql("COMMIT").unwrap(), Statement::Commit);
         assert_eq!(parse_sql("rollback").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn parses_dialect_transaction_aliases() {
+        assert_eq!(
+            parse_sql_with_dialect("BEGIN IMMEDIATE", SqlDialect::Sqlite).unwrap(),
+            Statement::Begin
+        );
+        assert_eq!(
+            parse_sql_with_dialect("END", SqlDialect::Sqlite).unwrap(),
+            Statement::Commit
+        );
+        assert_eq!(
+            parse_sql_with_dialect("BEGIN WORK", SqlDialect::PostgreSql).unwrap(),
+            Statement::Begin
+        );
+        assert_eq!(
+            parse_sql_with_dialect("COMMIT WORK", SqlDialect::PostgreSql).unwrap(),
+            Statement::Commit
+        );
+        assert_eq!(
+            parse_sql_with_dialect("ROLLBACK WORK", SqlDialect::PostgreSql).unwrap(),
+            Statement::Rollback
+        );
+        assert!(parse_sql_with_dialect("END", SqlDialect::Fsql).is_err());
     }
 
     #[test]

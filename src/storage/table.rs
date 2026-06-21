@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::identifier::normalize_identifier;
+use crate::logging::{FullTextTokenizer, GeoCoordinateSystem, VectorIndexOptions, VectorMetric};
 use crate::sql::ast::{Column, ColumnType, Filter, Order, Projection};
 use crate::storage::RowId;
 use crate::storage::codec::encode_string;
@@ -17,6 +18,25 @@ struct Index {
 struct FullTextIndex {
     column: String,
     map: BTreeMap<String, BTreeSet<RowId>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableRuntimeOptions {
+    pub(crate) fulltext_tokenizer: FullTextTokenizer,
+    pub(crate) vector_index: VectorIndexOptions,
+    pub(crate) geo_coordinate_system: GeoCoordinateSystem,
+    pub(crate) worker_threads: usize,
+}
+
+impl Default for TableRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            fulltext_tokenizer: FullTextTokenizer::Simple,
+            vector_index: VectorIndexOptions::default(),
+            geo_coordinate_system: GeoCoordinateSystem::Wgs84,
+            worker_threads: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +98,17 @@ impl Table {
         self.rebuild_indexes()
     }
 
+    #[cfg(test)]
     pub(crate) fn create_fulltext_index(&mut self, name: String, column: String) -> Result<()> {
+        self.create_fulltext_index_with_options(name, column, TableRuntimeOptions::default())
+    }
+
+    pub(crate) fn create_fulltext_index_with_options(
+        &mut self,
+        name: String,
+        column: String,
+        options: TableRuntimeOptions,
+    ) -> Result<()> {
         let column_ref = self.column(&column)?;
         if column_ref.ty != ColumnType::Text {
             return Err(Error::Execution(
@@ -95,13 +125,23 @@ impl Table {
                 map: BTreeMap::new(),
             },
         );
-        self.rebuild_indexes()
+        self.rebuild_indexes_with_options(options)
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         columns: Option<Vec<String>>,
         values: Vec<Value>,
+    ) -> Result<()> {
+        self.insert_with_options(columns, values, TableRuntimeOptions::default())
+    }
+
+    pub(crate) fn insert_with_options(
+        &mut self,
+        columns: Option<Vec<String>>,
+        values: Vec<Value>,
+        options: TableRuntimeOptions,
     ) -> Result<()> {
         let mut row = self
             .columns
@@ -125,16 +165,20 @@ impl Table {
 
         for (column_name, value) in target_columns.into_iter().zip(values) {
             let column = self.column(&column_name)?;
-            row.insert(column.name.clone(), Self::validate_value(column, value)?);
+            row.insert(
+                column.name.clone(),
+                Self::validate_value_with_options(column, value, options)?,
+            );
         }
 
         self.validate_primary_insert(&row)?;
         let row_id = self.next_row_id;
         self.next_row_id += 1;
         self.rows.insert(row_id, row);
-        self.rebuild_indexes()
+        self.rebuild_indexes_with_options(options)
     }
 
+    #[cfg(test)]
     pub(crate) fn select(
         &self,
         projection: Projection,
@@ -142,9 +186,26 @@ impl Table {
         order: Option<Order>,
         limit: Option<usize>,
     ) -> Result<Vec<Row>> {
+        self.select_with_options(
+            projection,
+            filter,
+            order,
+            limit,
+            TableRuntimeOptions::default(),
+        )
+    }
+
+    pub(crate) fn select_with_options(
+        &self,
+        projection: Projection,
+        filter: Option<Filter>,
+        order: Option<Order>,
+        limit: Option<usize>,
+        options: TableRuntimeOptions,
+    ) -> Result<Vec<Row>> {
         self.validate_projection(&projection)?;
-        let filter = self.normalize_filter(filter)?;
-        let mut row_ids = self.matching_row_ids(filter.as_ref())?;
+        let filter = self.normalize_filter(filter, options)?;
+        let mut row_ids = self.matching_row_ids(filter.as_ref(), options)?;
 
         if let Some(Order::VectorDistance {
             column,
@@ -159,15 +220,14 @@ impl Table {
                 ));
             }
 
-            let mut scored = Vec::new();
-            for row_id in row_ids {
-                let vector = self.rows.get(&row_id).and_then(|row| row.get(&column));
-                if let Some(Value::Vector(vector)) = vector {
-                    scored.push((vector_distance(vector, &target)?, row_id));
-                } else {
-                    continue;
+            if let Some(expected) = options.vector_index.dimensions {
+                if target.len() != expected {
+                    return Err(Error::Execution(format!(
+                        "query vector dimensions must be {expected}"
+                    )));
                 }
             }
+            let mut scored = vector_scores(&self.rows, &row_ids, &column, &target, options)?;
             scored.sort_by(|left, right| {
                 let distance = left
                     .0
@@ -196,18 +256,31 @@ impl Table {
             .collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn update(
         &mut self,
         assignments: Vec<(String, Value)>,
         filter: Option<Filter>,
     ) -> Result<usize> {
-        let filter = self.normalize_filter(filter)?;
-        let row_ids = self.matching_row_ids(filter.as_ref())?;
+        self.update_with_options(assignments, filter, TableRuntimeOptions::default())
+    }
+
+    pub(crate) fn update_with_options(
+        &mut self,
+        assignments: Vec<(String, Value)>,
+        filter: Option<Filter>,
+        options: TableRuntimeOptions,
+    ) -> Result<usize> {
+        let filter = self.normalize_filter(filter, options)?;
+        let row_ids = self.matching_row_ids(filter.as_ref(), options)?;
 
         let mut normalized = Vec::new();
         for (column_name, value) in assignments {
             let column = self.column(&column_name)?;
-            normalized.push((column.name.clone(), Self::validate_value(column, value)?));
+            normalized.push((
+                column.name.clone(),
+                Self::validate_value_with_options(column, value, options)?,
+            ));
         }
 
         let original_rows = self.rows.clone();
@@ -220,21 +293,30 @@ impl Table {
         }
 
         self.rows = updated_rows;
-        if let Err(error) = self.rebuild_indexes() {
+        if let Err(error) = self.rebuild_indexes_with_options(options) {
             self.rows = original_rows;
-            let _ = self.rebuild_indexes();
+            let _ = self.rebuild_indexes_with_options(options);
             return Err(error);
         }
         Ok(row_ids.len())
     }
 
+    #[cfg(test)]
     pub(crate) fn delete(&mut self, filter: Option<Filter>) -> Result<usize> {
-        let filter = self.normalize_filter(filter)?;
-        let row_ids = self.matching_row_ids(filter.as_ref())?;
+        self.delete_with_options(filter, TableRuntimeOptions::default())
+    }
+
+    pub(crate) fn delete_with_options(
+        &mut self,
+        filter: Option<Filter>,
+        options: TableRuntimeOptions,
+    ) -> Result<usize> {
+        let filter = self.normalize_filter(filter, options)?;
+        let row_ids = self.matching_row_ids(filter.as_ref(), options)?;
         for row_id in &row_ids {
             self.rows.remove(row_id);
         }
-        self.rebuild_indexes()?;
+        self.rebuild_indexes_with_options(options)?;
         Ok(row_ids.len())
     }
 
@@ -273,6 +355,13 @@ impl Table {
     }
 
     pub(crate) fn rebuild_indexes(&mut self) -> Result<()> {
+        self.rebuild_indexes_with_options(TableRuntimeOptions::default())
+    }
+
+    pub(crate) fn rebuild_indexes_with_options(
+        &mut self,
+        options: TableRuntimeOptions,
+    ) -> Result<()> {
         self.primary.clear();
         for index in self.indexes.values_mut() {
             index.map.clear();
@@ -320,7 +409,7 @@ impl Table {
                         .fulltext_indexes
                         .get_mut(index_name)
                         .expect("full-text index exists");
-                    for token in tokenize(text) {
+                    for token in tokenize(text, options.fulltext_tokenizer) {
                         fulltext.map.entry(token).or_default().insert(*row_id);
                     }
                 }
@@ -354,13 +443,17 @@ impl Table {
         Ok(())
     }
 
-    fn normalize_filter(&self, filter: Option<Filter>) -> Result<Option<Filter>> {
+    fn normalize_filter(
+        &self,
+        filter: Option<Filter>,
+        options: TableRuntimeOptions,
+    ) -> Result<Option<Filter>> {
         match filter {
             Some(Filter::Equals(column_name, value)) => {
                 let column = self.column(&column_name)?;
                 Ok(Some(Filter::Equals(
                     column.name.clone(),
-                    Self::validate_value(column, value)?,
+                    Self::validate_value_with_options(column, value, options)?,
                 )))
             }
             Some(Filter::FullText { column, query }) => {
@@ -396,7 +489,11 @@ impl Table {
         }
     }
 
-    fn matching_row_ids(&self, filter: Option<&Filter>) -> Result<Vec<RowId>> {
+    fn matching_row_ids(
+        &self,
+        filter: Option<&Filter>,
+        options: TableRuntimeOptions,
+    ) -> Result<Vec<RowId>> {
         match filter {
             None => Ok(self.rows.keys().copied().collect()),
             Some(Filter::Equals(column, value)) => {
@@ -421,7 +518,7 @@ impl Table {
                     .filter_map(|(row_id, row)| (row.get(column) == Some(value)).then_some(*row_id))
                     .collect())
             }
-            Some(Filter::FullText { column, query }) => self.match_fulltext(column, query),
+            Some(Filter::FullText { column, query }) => self.match_fulltext(column, query, options),
             Some(Filter::GeoWithin {
                 column,
                 point,
@@ -432,7 +529,8 @@ impl Table {
                 .iter()
                 .filter_map(|(row_id, row)| match row.get(column) {
                     Some(Value::Point(candidate)) => {
-                        let distance = haversine_meters(*candidate, *point);
+                        let distance =
+                            geo_distance(*candidate, *point, options.geo_coordinate_system);
                         ((*inclusive && distance <= *meters) || (!*inclusive && distance < *meters))
                             .then_some(*row_id)
                     }
@@ -442,8 +540,13 @@ impl Table {
         }
     }
 
-    fn match_fulltext(&self, column: &str, query: &str) -> Result<Vec<RowId>> {
-        let tokens = tokenize(query);
+    fn match_fulltext(
+        &self,
+        column: &str,
+        query: &str,
+        options: TableRuntimeOptions,
+    ) -> Result<Vec<RowId>> {
+        let tokens = tokenize(query, options.fulltext_tokenizer);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -468,7 +571,9 @@ impl Table {
             .iter()
             .filter_map(|(row_id, row)| match row.get(column) {
                 Some(Value::Text(text)) => {
-                    let row_tokens = tokenize(text).into_iter().collect::<BTreeSet<_>>();
+                    let row_tokens = tokenize(text, options.fulltext_tokenizer)
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
                     tokens
                         .iter()
                         .all(|token| row_tokens.contains(token))
@@ -487,7 +592,11 @@ impl Table {
             .ok_or_else(|| Error::Execution(format!("unknown column {normalized}")))
     }
 
-    fn validate_value(column: &Column, value: Value) -> Result<Value> {
+    fn validate_value_with_options(
+        column: &Column,
+        value: Value,
+        options: TableRuntimeOptions,
+    ) -> Result<Value> {
         match (&column.ty, value) {
             (_, Value::Null) => Ok(Value::Null),
             (ColumnType::Integer, Value::Integer(value)) => Ok(Value::Integer(value)),
@@ -500,7 +609,12 @@ impl Table {
             (ColumnType::Vector, Value::Vector(value))
                 if value.iter().all(|item| item.is_finite()) =>
             {
-                Ok(Value::Vector(value))
+                match options.vector_index.dimensions {
+                    Some(expected) if value.len() != expected => {
+                        vector_dimension_error(&column.name, expected)
+                    }
+                    _ => Ok(Value::Vector(value)),
+                }
             }
             (ColumnType::Point, Value::Point(value))
                 if value.lon.is_finite() && value.lat.is_finite() =>
@@ -561,27 +675,126 @@ fn index_key(value: &Value) -> Result<String> {
     Ok(key)
 }
 
-fn tokenize(input: &str) -> Vec<String> {
-    input
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_ascii_lowercase())
-        .collect()
+fn vector_scores(
+    rows: &BTreeMap<RowId, Row>,
+    row_ids: &[RowId],
+    column: &str,
+    target: &[f32],
+    options: TableRuntimeOptions,
+) -> Result<Vec<(f64, RowId)>> {
+    if options.worker_threads <= 1 || row_ids.len() < 2 {
+        return vector_scores_chunk(rows, row_ids, column, target, options.vector_index.metric);
+    }
+
+    let workers = options.worker_threads.min(row_ids.len());
+    let chunk_size = (row_ids.len() + workers - 1) / workers;
+    std::thread::scope(|scope| {
+        let handles = row_ids
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    vector_scores_chunk(rows, chunk, column, target, options.vector_index.metric)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut scored = Vec::new();
+        for handle in handles {
+            scored.extend(handle.join().expect("vector worker panicked")?);
+        }
+        Ok(scored)
+    })
 }
 
-fn vector_distance(left: &[f32], right: &[f32]) -> Result<f64> {
+fn vector_scores_chunk(
+    rows: &BTreeMap<RowId, Row>,
+    row_ids: &[RowId],
+    column: &str,
+    target: &[f32],
+    metric: VectorMetric,
+) -> Result<Vec<(f64, RowId)>> {
+    let mut scored = Vec::new();
+    for row_id in row_ids {
+        let vector = rows.get(row_id).and_then(|row| row.get(column));
+        if let Some(Value::Vector(vector)) = vector {
+            scored.push((vector_distance(vector, target, metric)?, *row_id));
+        }
+    }
+    Ok(scored)
+}
+
+fn vector_dimension_error(column: &str, expected: usize) -> Result<Value> {
+    let message = format!("vector column {column} requires {expected} dimension(s)");
+    Err(Error::Execution(message))
+}
+
+fn tokenize(input: &str, tokenizer: FullTextTokenizer) -> Vec<String> {
+    match tokenizer {
+        FullTextTokenizer::Simple => input
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_lowercase())
+            .collect(),
+        FullTextTokenizer::Whitespace => input
+            .split_whitespace()
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_lowercase())
+            .collect(),
+        FullTextTokenizer::Exact => {
+            let token = input.trim().to_lowercase();
+            if token.is_empty() {
+                Vec::new()
+            } else {
+                vec![token]
+            }
+        }
+    }
+}
+
+fn vector_distance(left: &[f32], right: &[f32], metric: VectorMetric) -> Result<f64> {
     if left.len() != right.len() {
         return Err(Error::Execution("vector dimensions do not match".into()));
     }
-    Ok(left
-        .iter()
+    match metric {
+        VectorMetric::Euclidean => Ok(left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| {
+                let delta = f64::from(*left) - f64::from(*right);
+                delta * delta
+            })
+            .sum::<f64>()
+            .sqrt()),
+        VectorMetric::Cosine => {
+            let dot = dot_product(left, right);
+            let left_norm = dot_product(left, left).sqrt();
+            let right_norm = dot_product(right, right).sqrt();
+            if left_norm == 0.0 || right_norm == 0.0 {
+                return Err(Error::Execution(
+                    "cosine vector distance requires non-zero vectors".into(),
+                ));
+            }
+            Ok(1.0 - dot / (left_norm * right_norm))
+        }
+        VectorMetric::DotProduct => Ok(-dot_product(left, right)),
+    }
+}
+
+fn dot_product(left: &[f32], right: &[f32]) -> f64 {
+    left.iter()
         .zip(right)
-        .map(|(left, right)| {
-            let delta = f64::from(*left) - f64::from(*right);
-            delta * delta
-        })
-        .sum::<f64>()
-        .sqrt())
+        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+        .sum()
+}
+
+fn geo_distance(left: Point, right: Point, coordinate_system: GeoCoordinateSystem) -> f64 {
+    match coordinate_system {
+        GeoCoordinateSystem::Wgs84 => haversine_meters(left, right),
+        GeoCoordinateSystem::Cartesian => {
+            let delta_x = right.lon - left.lon;
+            let delta_y = right.lat - left.lat;
+            (delta_x * delta_x + delta_y * delta_y).sqrt()
+        }
+    }
 }
 
 fn haversine_meters(left: Point, right: Point) -> f64 {
@@ -786,6 +999,165 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn runtime_options_change_fulltext_vector_and_geo_behavior() {
+        let mut table = users();
+        let exact_options = TableRuntimeOptions {
+            fulltext_tokenizer: FullTextTokenizer::Exact,
+            ..TableRuntimeOptions::default()
+        };
+        table
+            .create_fulltext_index_with_options("name_exact".into(), "name".into(), exact_options)
+            .unwrap();
+        table
+            .insert_with_options(
+                Some(vec![
+                    "id".into(),
+                    "name".into(),
+                    "embedding".into(),
+                    "place".into(),
+                ]),
+                vec![
+                    Value::Integer(1),
+                    Value::Text("Ada Lovelace".into()),
+                    Value::Vector(vec![10.0, 0.0]),
+                    Value::Point(Point { lon: 0.0, lat: 2.0 }),
+                ],
+                exact_options,
+            )
+            .unwrap();
+        table
+            .insert_with_options(
+                Some(vec![
+                    "id".into(),
+                    "name".into(),
+                    "embedding".into(),
+                    "place".into(),
+                ]),
+                vec![
+                    Value::Integer(2),
+                    Value::Text("Grace Hopper".into()),
+                    Value::Vector(vec![0.0, 1.0]),
+                    Value::Point(Point { lon: 0.0, lat: 0.0 }),
+                ],
+                exact_options,
+            )
+            .unwrap();
+
+        assert!(
+            table
+                .select_with_options(
+                    Projection::All,
+                    Some(Filter::FullText {
+                        column: "name".into(),
+                        query: "Ada".into(),
+                    }),
+                    None,
+                    None,
+                    exact_options,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            table
+                .select_with_options(
+                    Projection::All,
+                    Some(Filter::FullText {
+                        column: "name".into(),
+                        query: "Ada Lovelace".into(),
+                    }),
+                    None,
+                    None,
+                    exact_options,
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let vector_options = TableRuntimeOptions {
+            vector_index: VectorIndexOptions {
+                metric: VectorMetric::DotProduct,
+                dimensions: Some(2),
+                ..VectorIndexOptions::default()
+            },
+            worker_threads: 2,
+            ..TableRuntimeOptions::default()
+        };
+        let rows = table
+            .select_with_options(
+                Projection::Columns(vec!["id".into()]),
+                None,
+                Some(Order::VectorDistance {
+                    column: "embedding".into(),
+                    target: vec![1.0, 0.0],
+                    descending: false,
+                }),
+                Some(1),
+                vector_options,
+            )
+            .unwrap();
+        assert_eq!(rows[0].get("id"), Some(&Value::Integer(1)));
+        assert!(
+            table
+                .insert_with_options(
+                    Some(vec!["id".into(), "embedding".into()]),
+                    vec![Value::Integer(3), Value::Vector(vec![1.0])],
+                    vector_options,
+                )
+                .is_err()
+        );
+        let mut vector_only = Table::new(
+            "vectors".into(),
+            vec![column("embedding", ColumnType::Vector, false)],
+        )
+        .unwrap();
+        assert!(
+            vector_only
+                .insert_with_options(None, vec![Value::Vector(vec![1.0])], vector_options,)
+                .is_err()
+        );
+        assert!(
+            table
+                .select_with_options(
+                    Projection::All,
+                    None,
+                    Some(Order::VectorDistance {
+                        column: "embedding".into(),
+                        target: vec![1.0],
+                        descending: false,
+                    }),
+                    None,
+                    vector_options,
+                )
+                .is_err()
+        );
+
+        let geo_options = TableRuntimeOptions {
+            geo_coordinate_system: GeoCoordinateSystem::Cartesian,
+            ..TableRuntimeOptions::default()
+        };
+        assert_eq!(
+            table
+                .select_with_options(
+                    Projection::All,
+                    Some(Filter::GeoWithin {
+                        column: "place".into(),
+                        point: Point { lon: 0.0, lat: 0.0 },
+                        meters: 2.5,
+                        inclusive: true,
+                    }),
+                    None,
+                    None,
+                    geo_options,
+                )
+                .unwrap()
+                .len(),
+            2
         );
     }
 
@@ -1148,9 +1520,25 @@ mod tests {
             map: BTreeMap::new(),
         };
         assert_eq!(fulltext.clone(), fulltext);
-        assert_eq!(tokenize("Rust, SQL! rust"), vec!["rust", "sql", "rust"]);
-        assert_eq!(vector_distance(&[3.0, 4.0], &[0.0, 0.0]).unwrap(), 5.0);
-        assert!(vector_distance(&[1.0], &[1.0, 2.0]).is_err());
+        assert_eq!(
+            tokenize("Rust, SQL! rust", FullTextTokenizer::Simple),
+            vec!["rust", "sql", "rust"]
+        );
+        assert_eq!(
+            tokenize("Rust-SQL rust", FullTextTokenizer::Whitespace),
+            vec!["rust-sql", "rust"]
+        );
+        assert!(tokenize("   ", FullTextTokenizer::Exact).is_empty());
+        assert_eq!(
+            vector_distance(&[3.0, 4.0], &[0.0, 0.0], VectorMetric::Euclidean).unwrap(),
+            5.0
+        );
+        assert_eq!(
+            vector_distance(&[1.0, 0.0], &[1.0, 0.0], VectorMetric::Cosine).unwrap(),
+            0.0
+        );
+        assert!(vector_distance(&[0.0, 0.0], &[1.0, 0.0], VectorMetric::Cosine).is_err());
+        assert!(vector_distance(&[1.0], &[1.0, 2.0], VectorMetric::Euclidean).is_err());
         assert_eq!(index_key(&Value::Null).unwrap(), "N");
         assert!(index_key(&Value::Float(1.0)).unwrap().starts_with("F:"));
         assert_eq!(index_key(&Value::Boolean(true)).unwrap(), "B:1");

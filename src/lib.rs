@@ -10,7 +10,10 @@ mod value;
 
 pub use engine::Database;
 pub use error::Error;
-pub use logging::DatabaseOptions;
+pub use logging::{
+    DatabaseOptions, FsyncMode, FullTextTokenizer, GeoCoordinateSystem, SqlDialect,
+    VectorIndexOptions, VectorMetric, WalMode,
+};
 pub use pool::{Connection, ConnectionPool};
 pub use query::QueryResult;
 pub use value::{Point, Row, Value};

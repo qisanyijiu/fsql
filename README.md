@@ -62,9 +62,25 @@ embedded engine.
 
 ```rust
 use std::time::Duration;
-use fsql::{ConnectionPool, DatabaseOptions};
+use fsql::{
+    ConnectionPool, DatabaseOptions, FsyncMode, FullTextTokenizer,
+    GeoCoordinateSystem, SqlDialect, VectorIndexOptions, VectorMetric, WalMode,
+};
 
 let options = DatabaseOptions::default()
+    .with_page_size(8192)
+    .with_cache_capacity(256)
+    .with_wal_mode(WalMode::RedoLog)
+    .with_fsync_mode(FsyncMode::DataOnly)
+    .with_worker_threads(4)
+    .with_sql_dialect(SqlDialect::Sqlite)
+    .with_fulltext_tokenizer(FullTextTokenizer::Simple)
+    .with_vector_index(VectorIndexOptions {
+        metric: VectorMetric::Cosine,
+        dimensions: Some(2),
+        ..VectorIndexOptions::default()
+    })
+    .with_geo_coordinate_system(GeoCoordinateSystem::Wgs84)
     .with_slow_sql_log("slow.log", Duration::from_millis(50))
     .with_error_log("error.log")
     .with_binlog("bin.log")
@@ -84,6 +100,30 @@ The log streams are append-only text files:
 - Binlog: logical mutating SQL and transaction-control SQL.
 - Redolog: `BEGIN`, `COMMIT`, and `ABORT` records around mutations and commits.
 - Undolog: catalog snapshots before mutating statements.
+
+## Configuration
+
+`DatabaseOptions` is the central runtime configuration object. Defaults are
+valid and conservative; `open_with_options` validates the options before
+opening a file-backed database, and `try_memory_with_options` does the same for
+in-memory databases.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `page_size` | `4096` | Chunk size used by the file persistence write path. Must be a power of two from 512 to 65536. |
+| `cache_capacity` | `128` | Number of parsed SQL statements kept in the in-memory statement cache. `0` disables the cache. |
+| `wal_mode` | `Disabled` | Controls redo logging. `with_redolog(...)` enables `RedoLog`; `Disabled` suppresses redo output even when a path is set. |
+| `fsync_mode` | `Always` | Persistence and log sync strategy: `Always`, `DataOnly`, or `Never`. |
+| `worker_threads` | `1` | Runtime worker-thread setting. Vector distance ordering uses it to parallelize candidate scoring when more than one worker is configured. |
+| `sql_dialect` | `Fsql` | Parser dialect. `Sqlite` accepts aliases such as `BEGIN IMMEDIATE` and `END`; `PostgreSql` accepts `BEGIN WORK`, `COMMIT WORK`, and `ROLLBACK WORK`. |
+| `fulltext_tokenizer` | `Simple` | Full-text tokenizer used for index rebuilds and `MATCH`: `Simple`, `Whitespace`, or `Exact`. |
+| `vector_index` | Euclidean, dynamic dimensions | Vector search settings: metric (`Euclidean`, `Cosine`, `DotProduct`), optional dimension enforcement, `ef_search`, and `m`. |
+| `geo_coordinate_system` | `Wgs84` | Geo distance calculation: haversine meters for `Wgs84`, Euclidean units for `Cartesian`. |
+| `slow_sql_threshold` / `slow_sql_log_path` | disabled | Successful statements at or above the threshold are appended to the slow SQL log. |
+| `error_log_path` | disabled | Failed statements are appended to the error log. |
+| `binlog_path` | disabled | Mutating SQL and transaction-control SQL are appended to the binlog. |
+| `redolog_path` | disabled | Redo events are appended when `wal_mode` is `RedoLog`. |
+| `undolog_path` | disabled | Catalog snapshots are appended before mutating statements. |
 
 ## SQL subset
 
@@ -141,12 +181,12 @@ This is intentionally a prototype, not a full SQL engine.
 
 - `WHERE` does not support `AND`, `OR`, ranges, joins, or arbitrary expressions
 - `ORDER BY` only supports `VECTOR_DISTANCE(...)`
-- Full-text search tokenizes by non-alphanumeric separators, lowercases tokens,
-  and matches all query tokens
-- Vector ordering requires the query vector and stored vector to have the same
-  dimensions
-- Geographic distance uses the haversine formula and interprets thresholds in
-  meters
+- Full-text tokenization is configurable; the default `Simple` tokenizer splits
+  by non-alphanumeric separators and lowercases tokens
+- Vector ordering requires the query vector and stored vector to have matching
+  dimensions, and configured dimensions are enforced when set
+- Geographic distance defaults to WGS84 haversine meters and can be switched to
+  Cartesian distance
 - The connection pool is thread-safe and supports concurrent callers, but the
   current engine serializes statement execution instead of providing MVCC.
 - Binlog, redolog, and undolog are written and tested as append-only streams;
