@@ -1,5 +1,6 @@
 mod engine;
 mod error;
+pub mod ffi;
 mod identifier;
 mod logging;
 mod pool;

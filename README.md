@@ -175,6 +175,94 @@ DELETE FROM docs WHERE id = 1;
   ordering on `VECTOR` columns
 - `LIMIT n` is supported on `SELECT`
 
+## Language bindings
+
+This repository now includes a native FFI layer so the same embedded engine can
+be used from C, C++, Go, Python, and Swift.
+
+### What changed
+
+- `Cargo.toml` now builds `rlib`, `cdylib`, and `staticlib` artifacts
+- `src/ffi.rs` exports a stable C ABI over the existing Rust engine
+- `include_fsql.h` declares the foreign interface
+- The repository includes runnable binding examples for C, C++, Go, Python, and
+  Swift
+
+The FFI surface exposes:
+
+- `Database` creation for in-memory and file-backed databases
+- `ConnectionPool` and checked-out `Connection` execution
+- `QueryResult` metadata such as row count, affected rows, and message
+- Typed value access for `NULL`, `INTEGER`, `FLOAT`, `BOOLEAN`, `TEXT`,
+  `VECTOR`, and `POINT`
+
+### ABI shape
+
+All bindings use the same structured result ABI instead of JSON.
+
+- `fsql_db_memory_new`, `fsql_db_open`, and `fsql_db_execute` expose the core
+  database lifecycle
+- `fsql_pool_memory_new`, `fsql_pool_open`, `fsql_pool_get`, and
+  `fsql_connection_execute` expose pooled access
+- `fsql_result_row_count`, `fsql_result_column_count`, `fsql_result_column_name`,
+  and `fsql_result_value_at` expose result traversal
+- `fsql_value_get_i64`, `fsql_value_get_f64`, `fsql_value_get_bool`,
+  `fsql_value_get_text`, `fsql_value_get_vector`, and `fsql_value_get_point`
+  expose typed payload reads
+
+Foreign callers inspect values through `FsqlValueKind` rather than assuming a
+shared memory layout.
+
+### Memory ownership
+
+The FFI layer uses Rust-owned opaque handles. Foreign callers must release them
+explicitly.
+
+- free results with `fsql_result_free`
+- free temporary strings with `fsql_string_free`
+- free values with `fsql_value_free`
+- free vectors with `fsql_vector_free`
+- free database, pool, and connection handles with their matching `*_free`
+  functions
+
+### Repository examples
+
+Example entry points included in the repository:
+
+- C: `bindings_c_example.c`
+- C++: `bindings_cpp_example.cpp`
+- Go: `bindings_go_main.go`
+- Python: `bindings_python_example.py`
+- Swift: `bindings_swift_main.swift`
+
+All five examples follow the same sequence:
+
+1. create an in-memory database
+2. create a table
+3. insert a row
+4. run a `SELECT`
+5. iterate columns and read typed values
+
+### Build and run
+
+```sh
+cargo build
+cc -I. bindings_c_example.c -Ltarget/debug -lfsql -o target/debug/bindings_c_example
+c++ -std=c++17 -I. bindings_cpp_example.cpp -Ltarget/debug -lfsql -o target/debug/bindings_cpp_example
+go run bindings_go_main.go
+python3 bindings_python_example.py
+swiftc bindings_swift_main.swift -Ltarget/debug -lfsql -o target/debug/bindings_swift_example
+```
+
+On macOS, set `DYLD_LIBRARY_PATH=target/debug` before running dynamically linked
+examples if the loader cannot find `libfsql.dylib` automatically.
+
+### Validation status
+
+The Rust test suite covers the FFI layer directly in addition to the core engine.
+The repository examples for C, C++, Go, Python, and Swift were all exercised
+successfully against the current ABI.
+
 ## Current limitations
 
 This is intentionally a prototype, not a full SQL engine.

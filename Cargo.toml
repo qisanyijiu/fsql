@@ -8,6 +8,7 @@ license = "MIT"
 [lib]
 name = "fsql"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 
