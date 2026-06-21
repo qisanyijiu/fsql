@@ -275,8 +275,17 @@ This is intentionally a prototype, not a full SQL engine.
   dimensions, and configured dimensions are enforced when set
 - Geographic distance defaults to WGS84 haversine meters and can be switched to
   Cartesian distance
-- The connection pool is thread-safe and supports concurrent callers, but the
-  current engine serializes statement execution instead of providing MVCC.
+- The connection pool is thread-safe and supports concurrent callers.
+  Transactions are now scoped to individual checked-out connections instead of a
+  single global transaction slot.
+- DML conflicts on the same locked row return a lock-conflict error. Concurrent
+  transactions can update different existing rows independently, and concurrent
+  inserts with different primary keys can commit successfully.
+- DDL stays serialized. `CREATE TABLE` and index creation are rejected while
+  active DML transactions hold row locks, and DDL is not allowed inside an
+  active transaction.
+- Full MVCC snapshots, blocking waits, and deadlock detection are not
+  implemented yet.
 - Binlog, redolog, and undolog are written and tested as append-only streams;
   automated crash recovery and replay are future work.
 

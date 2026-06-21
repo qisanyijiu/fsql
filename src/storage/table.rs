@@ -427,6 +427,10 @@ impl Table {
         Ok(())
     }
 
+    pub(crate) fn primary_key_column(&self) -> Option<&str> {
+        self.primary_key.as_deref()
+    }
+
     fn validate_primary_insert(&self, row: &Row) -> Result<()> {
         if let Some(primary_key) = &self.primary_key {
             let value = row
@@ -504,6 +508,15 @@ impl Table {
     ) -> Result<AccessPath> {
         let filter = self.normalize_filter(filter, options)?;
         Ok(self.matching_row_ids(filter.as_ref(), options)?.1)
+    }
+
+    pub(crate) fn matching_row_ids_for_lock(
+        &self,
+        filter: Option<Filter>,
+        options: TableRuntimeOptions,
+    ) -> Result<Vec<RowId>> {
+        let filter = self.normalize_filter(filter, options)?;
+        Ok(self.matching_row_ids(filter.as_ref(), options)?.0)
     }
 
     fn matching_row_ids(
@@ -686,7 +699,7 @@ fn project_row(row: &Row, projection: &Projection) -> Row {
     }
 }
 
-fn index_key(value: &Value) -> Result<String> {
+pub(crate) fn index_key(value: &Value) -> Result<String> {
     let key = match value {
         Value::Null => "N".to_string(),
         Value::Integer(value) => format!("I:{value}"),

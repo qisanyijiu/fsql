@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::logging::{
-    DatabaseOptions, FsyncMode, RedoEvent, append_binlog, append_error, append_redolog,
+    DatabaseOptions, FsyncMode, RedoEvent, SqlDialect, append_binlog, append_error, append_redolog,
     append_slow_sql, append_undolog, sync_file,
 };
 use crate::query::QueryResult;
@@ -21,6 +21,41 @@ pub struct Database {
     transaction: Option<Catalog>,
     options: DatabaseOptions,
     statement_cache: BTreeMap<String, Statement>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedStatementCache {
+    capacity: usize,
+    statements: BTreeMap<String, Statement>,
+}
+
+impl ParsedStatementCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            statements: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn parse(&mut self, sql: &str, dialect: SqlDialect) -> Result<Statement> {
+        if self.capacity == 0 {
+            return parse_sql_with_dialect(sql, dialect);
+        }
+
+        let key = sql.trim().trim_end_matches(';').trim().to_string();
+        if let Some(statement) = self.statements.get(&key) {
+            return Ok(statement.clone());
+        }
+
+        let statement = parse_sql_with_dialect(sql, dialect)?;
+        if self.statements.len() >= self.capacity {
+            if let Some(first_key) = self.statements.keys().next().cloned() {
+                self.statements.remove(&first_key);
+            }
+        }
+        self.statements.insert(key, statement.clone());
+        Ok(statement)
+    }
 }
 
 impl Database {
@@ -115,23 +150,12 @@ impl Database {
     }
 
     fn parse_statement(&mut self, sql: &str) -> Result<Statement> {
-        if self.options.cache_capacity == 0 {
-            return parse_sql_with_dialect(sql, self.options.sql_dialect);
-        }
-
-        let key = sql.trim().trim_end_matches(';').trim().to_string();
-        if let Some(statement) = self.statement_cache.get(&key) {
-            return Ok(statement.clone());
-        }
-
-        let statement = parse_sql_with_dialect(sql, self.options.sql_dialect)?;
-        if self.statement_cache.len() >= self.options.cache_capacity {
-            if let Some(first_key) = self.statement_cache.keys().next().cloned() {
-                self.statement_cache.remove(&first_key);
-            }
-        }
-        self.statement_cache.insert(key, statement.clone());
-        Ok(statement)
+        parse_with_cache(
+            &mut self.statement_cache,
+            self.options.cache_capacity,
+            sql,
+            self.options.sql_dialect,
+        )
     }
 
     fn execute_parsed(&mut self, statement: Statement) -> Result<QueryResult> {
@@ -222,12 +246,58 @@ impl Database {
         Ok(QueryResult::message("transaction rolled back"))
     }
 
-    fn active_catalog_mut(&mut self) -> &mut Catalog {
+    pub(crate) fn active_catalog_mut(&mut self) -> &mut Catalog {
         self.transaction.as_mut().unwrap_or(&mut self.catalog)
     }
 
-    fn active_catalog(&self) -> &Catalog {
+    pub(crate) fn active_catalog(&self) -> &Catalog {
         self.transaction.as_ref().unwrap_or(&self.catalog)
+    }
+
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    pub(crate) fn catalog_mut(&mut self) -> &mut Catalog {
+        &mut self.catalog
+    }
+
+    pub(crate) fn replace_catalog(&mut self, catalog: Catalog) {
+        self.catalog = catalog;
+        self.transaction = None;
+    }
+
+    pub(crate) fn options(&self) -> &DatabaseOptions {
+        &self.options
+    }
+
+    pub(crate) fn persist_catalog(&self, options: &DatabaseOptions) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut file = File::create(&tmp)?;
+        let encoded = self.catalog.encode();
+        for chunk in encoded.as_bytes().chunks(options.page_size) {
+            file.write_all(chunk)?;
+        }
+        sync_file(&file, options.fsync_mode)?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+
+        if options.fsync_mode != FsyncMode::Never {
+            if let Some(parent_file) = path.parent().and_then(|parent| File::open(parent).ok()) {
+                let _ = parent_file.sync_all();
+            }
+        }
+        Ok(())
     }
 
     fn persist(&self) -> Result<()> {
@@ -265,7 +335,7 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> Result<Quer
     execute_statement_with_options(catalog, statement, TableRuntimeOptions::default())
 }
 
-fn execute_statement_with_options(
+pub(crate) fn execute_statement_with_options(
     catalog: &mut Catalog,
     statement: Statement,
     options: TableRuntimeOptions,
@@ -385,7 +455,32 @@ fn explain_row(table: String, filter: Option<Filter>, access_path: AccessPath) -
     row
 }
 
-fn table_runtime_options(options: &DatabaseOptions) -> TableRuntimeOptions {
+pub(crate) fn parse_with_cache(
+    cache: &mut BTreeMap<String, Statement>,
+    capacity: usize,
+    sql: &str,
+    dialect: SqlDialect,
+) -> Result<Statement> {
+    if capacity == 0 {
+        return parse_sql_with_dialect(sql, dialect);
+    }
+
+    let key = sql.trim().trim_end_matches(';').trim().to_string();
+    if let Some(statement) = cache.get(&key) {
+        return Ok(statement.clone());
+    }
+
+    let statement = parse_sql_with_dialect(sql, dialect)?;
+    if cache.len() >= capacity {
+        if let Some(first_key) = cache.keys().next().cloned() {
+            cache.remove(&first_key);
+        }
+    }
+    cache.insert(key, statement.clone());
+    Ok(statement)
+}
+
+pub(crate) fn table_runtime_options(options: &DatabaseOptions) -> TableRuntimeOptions {
     TableRuntimeOptions {
         fulltext_tokenizer: options.fulltext_tokenizer,
         vector_index: options.vector_index,
