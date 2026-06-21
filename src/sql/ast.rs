@@ -52,6 +52,7 @@ pub(crate) enum Statement {
     Begin,
     Commit,
     Rollback,
+    Explain(Box<Statement>),
     CreateTable {
         name: String,
         columns: Vec<Column>,

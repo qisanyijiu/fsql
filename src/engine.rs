@@ -9,9 +9,10 @@ use crate::logging::{
     append_slow_sql, append_undolog, sync_file,
 };
 use crate::query::QueryResult;
-use crate::sql::ast::Statement;
+use crate::sql::ast::{Filter, Statement};
 use crate::sql::parse_sql_with_dialect;
-use crate::storage::{Catalog, Table, TableRuntimeOptions};
+use crate::storage::{AccessPath, Catalog, Table, TableRuntimeOptions};
+use crate::value::{Row, Value};
 use crate::{Error, Result};
 
 pub struct Database {
@@ -138,12 +139,35 @@ impl Database {
             Statement::Begin => self.begin(),
             Statement::Commit => self.commit(),
             Statement::Rollback => self.rollback(),
+            Statement::Explain(statement) => self.explain(*statement),
             statement => self.execute_catalog_statement(statement),
         }
     }
 
     pub fn in_transaction(&self) -> bool {
         self.transaction.is_some()
+    }
+
+    fn explain(&self, statement: Statement) -> Result<QueryResult> {
+        let options = table_runtime_options(&self.options);
+        match statement {
+            Statement::Select {
+                table,
+                filter,
+                order: _,
+                projection: _,
+                limit: _,
+            } => {
+                let table_ref = self
+                    .active_catalog()
+                    .tables
+                    .get(&table)
+                    .ok_or_else(|| Error::Execution("unknown table".into()))?;
+                let access_path = table_ref.explain_filter(filter.clone(), options)?;
+                Ok(QueryResult::rows(vec![explain_row(table, filter, access_path)]))
+            }
+            _ => Err(Error::Execution("EXPLAIN only supports SELECT".into())),
+        }
     }
 
     fn execute_catalog_statement(&mut self, statement: Statement) -> Result<QueryResult> {
@@ -320,10 +344,45 @@ fn execute_statement_with_options(
             let affected = table.delete_with_options(filter, options)?;
             Ok(QueryResult::affected(affected, "row(s) deleted"))
         }
-        Statement::Begin | Statement::Commit | Statement::Rollback => Err(Error::Execution(
-            "transaction statements must be executed by the transaction manager".into(),
-        )),
+        Statement::Begin | Statement::Commit | Statement::Rollback | Statement::Explain(_) => {
+            Err(Error::Execution(
+                "transaction statements must be executed by the transaction manager".into(),
+            ))
+        }
     }
+}
+
+fn explain_row(table: String, filter: Option<Filter>, access_path: AccessPath) -> Row {
+    let mut row = Row::new();
+    row.insert("table".into(), Value::Text(table));
+    row.insert(
+        "predicate".into(),
+        Value::Text(match filter {
+            Some(Filter::Equals(column, _)) => format!("{column} = ?"),
+            Some(Filter::FullText { column, .. }) => format!("MATCH({column}, ...)"),
+            Some(Filter::GeoWithin { column, .. }) => format!("GEO_DISTANCE({column}, ...)"),
+            None => "none".into(),
+        }),
+    );
+    match access_path {
+        AccessPath::TableScan => {
+            row.insert("access_method".into(), Value::Text("table_scan".into()));
+            row.insert("index_name".into(), Value::Null);
+        }
+        AccessPath::PrimaryKey => {
+            row.insert("access_method".into(), Value::Text("primary_key".into()));
+            row.insert("index_name".into(), Value::Text("PRIMARY".into()));
+        }
+        AccessPath::SecondaryIndex { index_name } => {
+            row.insert("access_method".into(), Value::Text("secondary_index".into()));
+            row.insert("index_name".into(), Value::Text(index_name));
+        }
+        AccessPath::FullTextIndex { index_name } => {
+            row.insert("access_method".into(), Value::Text("fulltext_index".into()));
+            row.insert("index_name".into(), Value::Text(index_name));
+        }
+    }
+    row
 }
 
 fn table_runtime_options(options: &DatabaseOptions) -> TableRuntimeOptions {
@@ -450,6 +509,62 @@ mod tests {
         assert!(db.execute("INSERT INTO missing VALUES (1)").is_err());
         assert!(db.execute("UPDATE missing SET id = 1").is_err());
         assert!(db.execute("DELETE FROM missing").is_err());
+    }
+
+    #[test]
+    fn explain_reports_access_paths() {
+        let mut db = Database::memory();
+        create_users(&mut db);
+        db.execute("CREATE INDEX users_age ON users(age)").unwrap();
+        db.execute("CREATE FULLTEXT INDEX users_name_fts ON users(name)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada Lovelace', 36)")
+            .unwrap();
+
+        let primary = db
+            .execute("EXPLAIN SELECT * FROM users WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            primary.rows[0].get("access_method"),
+            Some(&Value::Text("primary_key".into()))
+        );
+        assert_eq!(
+            primary.rows[0].get("index_name"),
+            Some(&Value::Text("PRIMARY".into()))
+        );
+
+        let secondary = db
+            .execute("EXPLAIN SELECT * FROM users WHERE age = 36")
+            .unwrap();
+        assert_eq!(
+            secondary.rows[0].get("access_method"),
+            Some(&Value::Text("secondary_index".into()))
+        );
+        assert_eq!(
+            secondary.rows[0].get("index_name"),
+            Some(&Value::Text("users_age".into()))
+        );
+
+        let fulltext = db
+            .execute("EXPLAIN SELECT * FROM users WHERE MATCH(name, 'ada')")
+            .unwrap();
+        assert_eq!(
+            fulltext.rows[0].get("access_method"),
+            Some(&Value::Text("fulltext_index".into()))
+        );
+        assert_eq!(
+            fulltext.rows[0].get("index_name"),
+            Some(&Value::Text("users_name_fts".into()))
+        );
+
+        let scan = db
+            .execute("EXPLAIN SELECT * FROM users WHERE name = 'Ada Lovelace'")
+            .unwrap();
+        assert_eq!(
+            scan.rows[0].get("access_method"),
+            Some(&Value::Text("table_scan".into()))
+        );
+        assert_eq!(scan.rows[0].get("index_name"), Some(&Value::Null));
     }
 
     #[test]

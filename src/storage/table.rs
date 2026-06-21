@@ -20,6 +20,14 @@ struct FullTextIndex {
     map: BTreeMap<String, BTreeSet<RowId>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AccessPath {
+    TableScan,
+    PrimaryKey,
+    SecondaryIndex { index_name: String },
+    FullTextIndex { index_name: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableRuntimeOptions {
     pub(crate) fulltext_tokenizer: FullTextTokenizer,
@@ -205,7 +213,7 @@ impl Table {
     ) -> Result<Vec<Row>> {
         self.validate_projection(&projection)?;
         let filter = self.normalize_filter(filter, options)?;
-        let mut row_ids = self.matching_row_ids(filter.as_ref(), options)?;
+        let mut row_ids = self.matching_row_ids(filter.as_ref(), options)?.0;
 
         if let Some(Order::VectorDistance {
             column,
@@ -272,7 +280,7 @@ impl Table {
         options: TableRuntimeOptions,
     ) -> Result<usize> {
         let filter = self.normalize_filter(filter, options)?;
-        let row_ids = self.matching_row_ids(filter.as_ref(), options)?;
+        let row_ids = self.matching_row_ids(filter.as_ref(), options)?.0;
 
         let mut normalized = Vec::new();
         for (column_name, value) in assignments {
@@ -312,7 +320,7 @@ impl Table {
         options: TableRuntimeOptions,
     ) -> Result<usize> {
         let filter = self.normalize_filter(filter, options)?;
-        let row_ids = self.matching_row_ids(filter.as_ref(), options)?;
+        let row_ids = self.matching_row_ids(filter.as_ref(), options)?.0;
         for row_id in &row_ids {
             self.rows.remove(row_id);
         }
@@ -489,34 +497,59 @@ impl Table {
         }
     }
 
+    pub(crate) fn explain_filter(
+        &self,
+        filter: Option<Filter>,
+        options: TableRuntimeOptions,
+    ) -> Result<AccessPath> {
+        let filter = self.normalize_filter(filter, options)?;
+        Ok(self.matching_row_ids(filter.as_ref(), options)?.1)
+    }
+
     fn matching_row_ids(
         &self,
         filter: Option<&Filter>,
         options: TableRuntimeOptions,
-    ) -> Result<Vec<RowId>> {
+    ) -> Result<(Vec<RowId>, AccessPath)> {
         match filter {
-            None => Ok(self.rows.keys().copied().collect()),
+            None => Ok((self.rows.keys().copied().collect(), AccessPath::TableScan)),
             Some(Filter::Equals(column, value)) => {
                 let key = index_key(value)?;
                 if self.primary_key.as_ref() == Some(column) {
-                    return Ok(self.primary.get(&key).copied().into_iter().collect());
+                    return Ok((
+                        self.primary.get(&key).copied().into_iter().collect(),
+                        AccessPath::PrimaryKey,
+                    ));
                 }
 
-                if let Some(index) = self.indexes.values().find(|index| &index.column == column) {
-                    return Ok(index
-                        .map
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect());
-                }
-
-                Ok(self
-                    .rows
+                if let Some((index_name, index)) = self
+                    .indexes
                     .iter()
-                    .filter_map(|(row_id, row)| (row.get(column) == Some(value)).then_some(*row_id))
-                    .collect())
+                    .find(|(_, index)| &index.column == column)
+                {
+                    return Ok((
+                        index
+                            .map
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                        AccessPath::SecondaryIndex {
+                            index_name: index_name.clone(),
+                        },
+                    ));
+                }
+
+                Ok((
+                    self.rows
+                        .iter()
+                        .filter_map(|(row_id, row)| {
+                            (row.get(column) == Some(value)).then_some(*row_id)
+                        })
+                        .collect(),
+                    AccessPath::TableScan,
+                ))
             }
             Some(Filter::FullText { column, query }) => self.match_fulltext(column, query, options),
             Some(Filter::GeoWithin {
@@ -524,19 +557,21 @@ impl Table {
                 point,
                 meters,
                 inclusive,
-            }) => Ok(self
-                .rows
-                .iter()
-                .filter_map(|(row_id, row)| match row.get(column) {
-                    Some(Value::Point(candidate)) => {
-                        let distance =
-                            geo_distance(*candidate, *point, options.geo_coordinate_system);
-                        ((*inclusive && distance <= *meters) || (!*inclusive && distance < *meters))
-                            .then_some(*row_id)
-                    }
-                    _ => None,
-                })
-                .collect()),
+            }) => Ok((
+                self.rows
+                    .iter()
+                    .filter_map(|(row_id, row)| match row.get(column) {
+                        Some(Value::Point(candidate)) => {
+                            let distance =
+                                geo_distance(*candidate, *point, options.geo_coordinate_system);
+                            ((*inclusive && distance <= *meters) || (!*inclusive && distance < *meters))
+                                .then_some(*row_id)
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                AccessPath::TableScan,
+            )),
         }
     }
 
@@ -545,16 +580,16 @@ impl Table {
         column: &str,
         query: &str,
         options: TableRuntimeOptions,
-    ) -> Result<Vec<RowId>> {
+    ) -> Result<(Vec<RowId>, AccessPath)> {
         let tokens = tokenize(query, options.fulltext_tokenizer);
         if tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), AccessPath::TableScan));
         }
 
-        if let Some(index) = self
+        if let Some((index_name, index)) = self
             .fulltext_indexes
-            .values()
-            .find(|index| index.column == column)
+            .iter()
+            .find(|(_, index)| index.column == column)
         {
             let mut sets = tokens
                 .iter()
@@ -563,25 +598,32 @@ impl Table {
             let result = sets.fold(first, |acc, set| {
                 acc.intersection(&set).copied().collect::<BTreeSet<_>>()
             });
-            return Ok(result.into_iter().collect());
+            return Ok((
+                result.into_iter().collect(),
+                AccessPath::FullTextIndex {
+                    index_name: index_name.clone(),
+                },
+            ));
         }
 
-        Ok(self
-            .rows
-            .iter()
-            .filter_map(|(row_id, row)| match row.get(column) {
-                Some(Value::Text(text)) => {
-                    let row_tokens = tokenize(text, options.fulltext_tokenizer)
-                        .into_iter()
-                        .collect::<BTreeSet<_>>();
-                    tokens
-                        .iter()
-                        .all(|token| row_tokens.contains(token))
-                        .then_some(*row_id)
-                }
-                _ => None,
-            })
-            .collect())
+        Ok((
+            self.rows
+                .iter()
+                .filter_map(|(row_id, row)| match row.get(column) {
+                    Some(Value::Text(text)) => {
+                        let row_tokens = tokenize(text, options.fulltext_tokenizer)
+                            .into_iter()
+                            .collect::<BTreeSet<_>>();
+                        tokens
+                            .iter()
+                            .all(|token| row_tokens.contains(token))
+                            .then_some(*row_id)
+                    }
+                    _ => None,
+                })
+                .collect(),
+            AccessPath::TableScan,
+        ))
     }
 
     fn column(&self, name: &str) -> Result<&Column> {
@@ -1412,6 +1454,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows[0].get("id"), Some(&Value::Integer(1)));
+    }
+
+    #[test]
+    fn explain_filter_reports_index_and_scan_choices() {
+        let mut table = users();
+        table.create_index("age_idx".into(), "age".into()).unwrap();
+        table
+            .create_fulltext_index("name_fts".into(), "name".into())
+            .unwrap();
+        table
+            .insert(
+                Some(vec!["id".into(), "name".into(), "age".into()]),
+                vec![
+                    Value::Integer(1),
+                    Value::Text("Ada Lovelace".into()),
+                    Value::Integer(36),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            table
+                .explain_filter(
+                    Some(Filter::Equals("id".into(), Value::Integer(1))),
+                    TableRuntimeOptions::default(),
+                )
+                .unwrap(),
+            AccessPath::PrimaryKey,
+        );
+        assert_eq!(
+            table
+                .explain_filter(
+                    Some(Filter::Equals("age".into(), Value::Integer(36))),
+                    TableRuntimeOptions::default(),
+                )
+                .unwrap(),
+            AccessPath::SecondaryIndex {
+                index_name: "age_idx".into(),
+            },
+        );
+        assert_eq!(
+            table
+                .explain_filter(
+                    Some(Filter::FullText {
+                        column: "name".into(),
+                        query: "ada".into(),
+                    }),
+                    TableRuntimeOptions::default(),
+                )
+                .unwrap(),
+            AccessPath::FullTextIndex {
+                index_name: "name_fts".into(),
+            },
+        );
+        assert_eq!(
+            table
+                .explain_filter(
+                    Some(Filter::Equals(
+                        "name".into(),
+                        Value::Text("Ada Lovelace".into()),
+                    )),
+                    TableRuntimeOptions::default(),
+                )
+                .unwrap(),
+            AccessPath::TableScan,
+        );
     }
 
     #[test]

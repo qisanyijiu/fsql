@@ -15,6 +15,9 @@ pub(crate) fn parse_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Result<S
         return Err(Error::Parse("empty SQL".into()));
     }
 
+    if starts_with_ci(sql, "EXPLAIN") {
+        return parse_explain(sql, dialect);
+    }
     if is_begin(sql, dialect) {
         return Ok(Statement::Begin);
     }
@@ -44,6 +47,19 @@ pub(crate) fn parse_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Result<S
     }
 
     Err(Error::Parse("unsupported SQL statement".into()))
+}
+
+fn parse_explain(sql: &str, dialect: SqlDialect) -> Result<Statement> {
+    let rest = sql["EXPLAIN".len()..].trim();
+    if rest.is_empty() {
+        return Err(Error::Parse("EXPLAIN requires a statement".into()));
+    }
+
+    let statement = parse_sql_with_dialect(rest, dialect)?;
+    match statement {
+        Statement::Select { .. } => Ok(Statement::Explain(Box::new(statement))),
+        _ => Err(Error::Parse("EXPLAIN only supports SELECT".into())),
+    }
 }
 
 fn is_begin(sql: &str, dialect: SqlDialect) -> bool {
@@ -700,6 +716,16 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_sql("EXPLAIN SELECT * FROM docs WHERE id = 1").unwrap(),
+            Statement::Explain(Box::new(Statement::Select {
+                table: "docs".into(),
+                projection: Projection::All,
+                filter: Some(Filter::Equals("id".into(), Value::Integer(1))),
+                order: None,
+                limit: None,
+            }))
+        );
+        assert_eq!(
             parse_sql("UPDATE docs SET title = \"x\", score = 2 WHERE id = 1").unwrap(),
             Statement::Update {
                 table: "docs".into(),
@@ -796,6 +822,8 @@ mod tests {
             "INSERT INTO t VALUES (POINT(1))",
             "INSERT INTO t VALUES (POINT(x, 0))",
             "INSERT INTO t VALUES (1.2.3)",
+            "EXPLAIN",
+            "EXPLAIN INSERT INTO t VALUES (1)",
             "INSERT INTO t VALUES ([x])",
             "INSERT INTO t VALUES ([nan])",
             "INSERT INTO t VALUES (nan)",
