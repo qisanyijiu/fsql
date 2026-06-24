@@ -125,9 +125,17 @@ in-memory databases.
 | `redolog_path` | disabled | Redo events are appended when `wal_mode` is `RedoLog`. |
 | `undolog_path` | disabled | Catalog snapshots are appended before mutating statements. |
 
-## SQL subset
+## SQL language support
 
-The current parser supports a compact SQL subset:
+The SQL front-end has two layers:
+
+- Executable SQL: the embedded engine executes the compact subset below.
+- Parsed compatibility SQL: common SQLite/standard SQL statement families are
+  accepted by the parser and preserved as `ParsedOnly`. Executing one of these
+  statements returns a clear "parsed successfully but execution is not
+  implemented yet" error instead of a parse error or fake success.
+
+Executable SQL:
 
 ```sql
 CREATE TABLE docs (
@@ -155,7 +163,7 @@ ROLLBACK;
 DELETE FROM docs WHERE id = 1;
 ```
 
-### Supported statements and values
+### Executable statements and values
 
 - `CREATE TABLE`, `CREATE INDEX`, `CREATE FULLTEXT INDEX`
 - `INSERT`, `SELECT`, `UPDATE`, `DELETE`
@@ -174,6 +182,28 @@ DELETE FROM docs WHERE id = 1;
 - `ORDER BY VECTOR_DISTANCE(column, [...]) ASC|DESC` supports nearest-neighbor
   ordering on `VECTOR` columns
 - `LIMIT n` is supported on `SELECT`
+
+### Parsed compatibility statements
+
+The parser also accepts the broader SQL language surface needed to continue
+toward SQLite compatibility, including:
+
+- `ALTER TABLE`, `ANALYZE`, `ATTACH`, `DETACH`, `PRAGMA`, `REINDEX`, `VACUUM`
+- `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`
+- `CREATE TABLE` variants such as `IF NOT EXISTS`, `TEMP`, constraints,
+  `DEFAULT`, `NOT NULL`, `CHECK`, `FOREIGN KEY`, `STRICT`, and `AS SELECT`
+- `CREATE VIEW`, `CREATE TRIGGER`, `CREATE VIRTUAL TABLE`
+- `CREATE UNIQUE INDEX`, expression indexes, multi-column indexes, collations,
+  sort-order indexes, and partial indexes
+- `DROP TABLE`, `DROP INDEX`, `DROP VIEW`, `DROP TRIGGER`
+- `INSERT OR ...`, `REPLACE`, `DEFAULT VALUES`, multi-row `VALUES`,
+  `INSERT ... SELECT`, and `ON CONFLICT ...`
+- Complex `SELECT` forms such as `SELECT` without `FROM`, `DISTINCT`, joins,
+  aliases, expression projections, `GROUP BY`, `HAVING`, compound selects,
+  ordinary `ORDER BY`, `OFFSET`, and CTEs with `WITH`
+- `UPDATE OR ...`, expression assignments, `UPDATE ... FROM`, `RETURNING`
+- `DELETE` aliases, `ORDER BY`, `LIMIT`, and `RETURNING`
+- Top-level `VALUES`
 
 ## Language bindings
 

@@ -5,6 +5,12 @@ use std::time::{Duration, Instant};
 
 use fsql::{Database, Value};
 
+/// - 创建性能基准测试使用的 `docs` 表结构。
+/// - Creates the `docs` table schema used by the performance baseline tests.
+/// - 夹具要求传入可写内存数据库，并固定包含全文、向量和地理查询所需列。
+/// - The fixture requires a writable in-memory database and always includes the columns needed for full-text, vector, and geo queries.
+/// - 通过执行 `CREATE TABLE` 修改数据库状态；建表失败会直接 panic。
+/// - Mutates database state by executing `CREATE TABLE`; panics immediately if creation fails.
 fn create_perf_table(db: &mut Database) {
     db.execute(
         "CREATE TABLE docs (
@@ -20,6 +26,10 @@ fn create_perf_table(db: &mut Database) {
 }
 
 #[test]
+/// - 测量批量插入与普通索引查找的基础性能。
+/// - Measures the baseline performance of bulk inserts and secondary-index lookups.
+/// - 场景聚焦批量写入后按年龄索引查询。
+/// - The scenario focuses on indexed age lookups after bulk inserts.
 fn perf_bulk_insert_and_index_lookup_baseline() {
     let mut db = Database::memory();
     create_perf_table(&mut db);
@@ -59,6 +69,10 @@ fn perf_bulk_insert_and_index_lookup_baseline() {
 }
 
 #[test]
+/// - 测量全文、向量排序和地理过滤查询的基础性能。
+/// - Measures the baseline performance of full-text, vector-ordering, and geo-filter queries.
+/// - 场景聚焦搜索夹具上的全文、向量和地理查询。
+/// - The scenario focuses on full-text, vector, and geo queries over the search fixture.
 fn perf_fulltext_vector_and_geo_baseline() {
     let mut db = Database::memory();
     create_perf_table(&mut db);

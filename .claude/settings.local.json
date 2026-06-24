@@ -3,7 +3,23 @@
     "allow": [
       "Bash(rg --files -g 'README*' -g 'package.json' -g 'pyproject.toml' -g 'Cargo.toml' -g 'go.mod' -g '*.sql' -g 'CLAUDE.md' -g 'AGENTS.md' .)",
       "Bash(rg *)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(cargo build *)",
+      "Bash(cc -I/Users/qsyj/Documents/fsql /Users/qsyj/Documents/fsql/bindings_c_example.c -L/Users/qsyj/Documents/fsql/target/debug -lfsql -o /Users/qsyj/Documents/fsql/target/debug/bindings_c_example)",
+      "Bash(DYLD_LIBRARY_PATH=/Users/qsyj/Documents/fsql/target/debug /Users/qsyj/Documents/fsql/target/debug/bindings_c_example)",
+      "Bash(c++ -std=c++17 -I/Users/qsyj/Documents/fsql /Users/qsyj/Documents/fsql/bindings_cpp_example.cpp -L/Users/qsyj/Documents/fsql/target/debug -lfsql -o /Users/qsyj/Documents/fsql/target/debug/bindings_cpp_example)",
+      "Bash(DYLD_LIBRARY_PATH=/Users/qsyj/Documents/fsql/target/debug /Users/qsyj/Documents/fsql/target/debug/bindings_cpp_example)",
+      "Bash(DYLD_LIBRARY_PATH=/Users/qsyj/Documents/fsql/target/debug /usr/local/go/bin/go run *)",
+      "Bash(DYLD_LIBRARY_PATH=/Users/qsyj/Documents/fsql/target/debug /opt/homebrew/bin/python3 *)",
+      "Bash(swiftc /Users/qsyj/Documents/fsql/bindings_swift_main.swift -L/Users/qsyj/Documents/fsql/target/debug -lfsql -o /Users/qsyj/Documents/fsql/target/debug/bindings_swift_example)",
+      "Bash(DYLD_LIBRARY_PATH=/Users/qsyj/Documents/fsql/target/debug /Users/qsyj/Documents/fsql/target/debug/bindings_swift_example)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git diff *)",
+      "Bash(python3 -)",
+      "Bash(perl *)"
     ]
   }
 }
